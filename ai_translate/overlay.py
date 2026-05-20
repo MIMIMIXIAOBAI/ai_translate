@@ -47,11 +47,7 @@ class TranslationOverlay(QWidget):
         self._border_radius = ov["border_radius"]
         self._min_font_size = ov["min_font_size"]
 
-        # Auto-contrast text colour
-        if is_dark_bg:
-            self._text_color = QColor("#e0e0e0")
-        else:
-            self._text_color = QColor("#1a1a1a")
+        self._text_color = QColor("#ffffff")
 
         self._init_ui()
 
