@@ -142,7 +142,7 @@
         <span id="gesture-label">● 默认状态</span>
     </div>
     <div id="hint">
-        握拳 = 压缩 &nbsp;|&nbsp; 张开手掌 = 发散 &nbsp;|&nbsp; 键盘: <kbd>←</kbd><kbd>→</kbd> 切换
+        移动手掌 = 移动球体 &nbsp;|&nbsp; 握拳 = 压缩 &nbsp;|&nbsp; 张开手掌 = 发散 &nbsp;|&nbsp; 键盘: <kbd>←</kbd><kbd>→</kbd> 切换
     </div>
     <div id="no-cam-msg">
         摄像头未连接<br>
@@ -181,9 +181,14 @@
                 gestureSmoothed: 'default',
                 handPresent: false,
                 camReady: false,
+                // hand position tracking (normalized 0..1 from MediaPipe)
+                handTargetX: 0.5,
+                handTargetY: 0.5,
+                handCurrentX: 0.5,
+                handCurrentY: 0.5,
                 // for smoothing gesture detection
                 gestureVotes: [], // rolling window of recent classifications
-                VOTE_WINDOW: 15,
+                VOTE_WINDOW: 8,
             };
 
             // ────────────────────────────────────
@@ -253,6 +258,13 @@
             }
 
             // ────────────────────────────────────
+            // Main group (moved by hand position)
+            // ────────────────────────────────────
+            const mainGroup = new THREE.Group();
+            mainGroup.name = 'main-group';
+            scene.add(mainGroup);
+
+            // ────────────────────────────────────
             // Main particle sphere
             // ────────────────────────────────────
             const sphereGeo = new THREE.BufferGeometry();
@@ -307,7 +319,7 @@
 
             const sphere = new THREE.Points(sphereGeo, sphereMat);
             sphere.name = 'main-sphere';
-            scene.add(sphere);
+            mainGroup.add(sphere);
 
             // ────────────────────────────────────
             // Orbiting ring particles (decorative)
@@ -348,7 +360,7 @@
                 });
                 const ring = new THREE.Points(ringGeo, ringMat);
                 ring.name = 'ring';
-                scene.add(ring);
+                mainGroup.add(ring);
                 ringParticles.push({ mesh: ring, count: ringCount, baseRadius: BASE_RADIUS * 1.4, offsets: ringOffsets });
             }
 
@@ -385,8 +397,8 @@
                 const tipDist = Math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z);
                 const pipDist = Math.hypot(pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z);
 
-                // extended if tip is significantly farther from mcp than pip is
-                return tipDist > pipDist * 1.25;
+                // extended if tip is farther from mcp than pip is (lower threshold = more sensitive)
+                return tipDist > pipDist * 1.08;
             }
 
             function isThumbExtended(landmarks) {
@@ -395,7 +407,7 @@
                 const mcp = landmarks[2];
                 const tipDist = Math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z);
                 const ipDist = Math.hypot(ip.x - mcp.x, ip.y - mcp.y, ip.z - mcp.z);
-                return tipDist > ipDist * 1.35;
+                return tipDist > ipDist * 1.12;
             }
 
             function classifyGesture(landmarks) {
@@ -423,10 +435,10 @@
                 // count occurrences
                 const counts = { fist: 0, open: 0, default: 0 };
                 for (const g of state.gestureVotes) counts[g]++;
-                // require >= 60% consensus to switch
+                // require >= 45% consensus to switch (faster response)
                 const total = state.gestureVotes.length;
-                if (counts.fist >= total * 0.6) return 'fist';
-                if (counts.open >= total * 0.6) return 'open';
+                if (counts.fist >= total * 0.45) return 'fist';
+                if (counts.open >= total * 0.45) return 'open';
                 return 'default';
             }
 
@@ -468,8 +480,13 @@
                         const rawGesture = classifyGesture(landmarks);
                         state.gestureSmoothed = smoothGesture(rawGesture);
                         state.handPresent = true;
+                        // track wrist position (landmark 0) for sphere movement
+                        state.handTargetX = landmarks[0].x;
+                        state.handTargetY = landmarks[0].y;
                     } else {
-                        // no hand visible → count as "default" votes toward return
+                        // no hand visible → return to center + count as "default"
+                        state.handTargetX = 0.5;
+                        state.handTargetY = 0.5;
                         state.gestureVotes.push('default');
                         if (state.gestureVotes.length > state.VOTE_WINDOW) {
                             state.gestureVotes.shift();
@@ -544,6 +561,19 @@
                     state.currentRadius = targetR;
                     state.velocity = 0;
                 }
+
+                // ── Hand-follow movement ──────────
+                // smoothly lerp toward hand position
+                const handLerp = 0.12;
+                state.handCurrentX += (state.handTargetX - state.handCurrentX) * handLerp;
+                state.handCurrentY += (state.handTargetY - state.handCurrentY) * handLerp;
+
+                // map normalized 0..1 coords to 3D world space
+                // MediaPipe x: 0=left, 1=right  |  y: 0=top, 1=bottom
+                const worldX = (state.handCurrentX - 0.5) * 7.0;
+                const worldY = -(state.handCurrentY - 0.5) * 5.0;
+                mainGroup.position.x = worldX;
+                mainGroup.position.y = worldY;
 
                 // ── Update gesture label ──────────
                 if (effectiveGesture !== state.gesture) {
@@ -644,13 +674,9 @@
                     ring.mesh.material.opacity = 0.3 + Math.min(radiusRatio, 1.5) * 0.15;
                 }
 
-                // ── Rotate sphere ──────────────────
-                sphere.rotation.y += dt * 0.25;
-                sphere.rotation.x += Math.sin(time * 0.4) * dt * 0.08;
-                if (ringParticles.length > 0) {
-                    ringParticles[0].mesh.rotation.y += dt * 0.35;
-                    ringParticles[0].mesh.rotation.x = sphere.rotation.x;
-                }
+                // ── Rotate group (sphere + ring together) ──
+                mainGroup.rotation.y += dt * 0.28;
+                mainGroup.rotation.x += Math.sin(time * 0.4) * dt * 0.08;
 
                 // ── Rotate background stars ────────
                 const stars = scene.getObjectByName('stars');
