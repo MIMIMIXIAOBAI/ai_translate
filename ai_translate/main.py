@@ -82,18 +82,19 @@ class _InfoToast(QWidget):
 
 class _TranslateThread(QThread):
     """Runs OCR + translation in a background thread."""
-    finished = Signal(str, str, QRect)
+    finished = Signal(str, str, QRect, int, float)
     error = Signal(str)
 
-    def __init__(self, img: Image.Image, rect: QRect):
+    def __init__(self, img: Image.Image, rect: QRect, dpr: float):
         super().__init__()
         self._img = img
         self._rect = rect
+        self._dpr = dpr
 
     def run(self):
         try:
             ocr = OcrEngine()
-            text = ocr.recognize(self._img)
+            text, font_px = ocr.recognize_with_size(self._img)
             if not text:
                 self.error.emit("未识别到文字")
                 return
@@ -102,7 +103,7 @@ class _TranslateThread(QThread):
             if not translated:
                 self.error.emit("翻译结果为空")
                 return
-            self.finished.emit(text, translated, self._rect)
+            self.finished.emit(text, translated, self._rect, font_px, self._dpr)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -191,18 +192,21 @@ class App:
         self._toast.show()
 
         # Start background thread
-        self._thread = _TranslateThread(img, logical)
+        dpr = selector.dpr
+        self._thread = _TranslateThread(img, logical, dpr)
         self._thread.finished.connect(self._on_translation_done)
         self._thread.error.connect(self._on_translation_error)
         self._thread.finished.connect(lambda: setattr(self, '_thread', None))
         self._thread.error.connect(lambda: setattr(self, '_thread', None))
         self._thread.start()
 
-    def _on_translation_done(self, original: str, translated: str, logical_rect: QRect):
+    def _on_translation_done(self, original: str, translated: str, logical_rect: QRect,
+                            font_size_px: int = 0, dpr: float = 1.0):
         if self._toast:
             self._toast.close()
             self._toast = None
-        self._overlay = TranslationOverlay(logical_rect, original, translated)
+        self._overlay = TranslationOverlay(
+            logical_rect, original, translated, font_size_px, dpr)
 
     def _on_translation_error(self, msg: str):
         if self._toast:

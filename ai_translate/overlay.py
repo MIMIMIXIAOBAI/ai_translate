@@ -3,18 +3,25 @@
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRect, QPoint
+from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import (
-    QPainter, QColor, QFont, QPen, QBrush, QFontMetrics,
-    QTextDocument, QAbstractTextDocumentLayout,
+    QPainter, QColor, QFont, QPen, QBrush,
+    QTextDocument, QFontMetrics,
 )
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QApplication
+from PySide6.QtWidgets import QWidget, QApplication
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
 class TranslationOverlay(QWidget):
-    def __init__(self, rect: QRect, original: str, translated: str):
+    def __init__(
+        self,
+        rect: QRect,
+        original: str,
+        translated: str,
+        font_size_px: int = 0,
+        dpr: float = 1.0,
+    ):
         super().__init__()
         self.original_text = original
         self.translated_text = translated
@@ -27,12 +34,18 @@ class TranslationOverlay(QWidget):
         self._bg_color = QColor(ov["background_color"])
         self._bg_color.setAlphaF(ov["background_opacity"])
         self._text_color = QColor(ov["text_color"])
-        self._font_size = ov["font_size"]
-        self._min_font_size = ov["min_font_size"]
-        self._max_w_ratio = ov["max_width_ratio"]
-        self._max_h_ratio = ov["max_height_ratio"]
         self._padding = ov["padding"]
         self._border_radius = ov["border_radius"]
+
+        # Determine font size: prefer estimated size, fall back to config
+        if font_size_px > 0 and dpr > 0:
+            logical_px = max(8, int(font_size_px / dpr))
+        else:
+            logical_px = ov["font_size"]
+        self._font = QFont("Microsoft YaHei")
+        self._font.setPixelSize(logical_px)
+
+        self._min_font_size = ov["min_font_size"]
 
         self._init_ui()
 
@@ -45,58 +58,68 @@ class TranslationOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-        # Size overlay to fit within screen bounds with some margin
-        screen = QApplication.primaryScreen()
-        if screen:
-            screen_geom = screen.availableGeometry()
-            max_w = int(screen_geom.width() * self._max_w_ratio)
-            max_h = int(screen_geom.height() * self._max_h_ratio)
-        else:
-            max_w, max_h = 1200, 800
-
-        text_w, text_h = self._calc_text_size(max_w)
-        w = min(text_w + self._padding * 2, max_w)
-        h = min(text_h + self._padding * 2, max_h)
-
-        # Position near the top-left of the original region, clamped to screen
+        # Size to match the original selected region exactly
         x = max(0, self._region.x())
         y = max(0, self._region.y())
+        w = max(60, self._region.width())
+        h = max(40, self._region.height())
         self.setGeometry(x, y, w, h)
         self.show()
 
-    def _calc_text_size(self, max_w: int) -> tuple[int, int]:
-        """Calculate required size for the translated text."""
-        doc = QTextDocument()
-        doc.setDefaultFont(QFont("Microsoft YaHei", self._font_size))
-        doc.setPlainText(self.translated_text)
-        doc.setTextWidth(max_w - self._padding * 2)
-        size = doc.documentLayout().documentSize()
-        return int(size.width()), int(size.height())
+    def _effective_font(self) -> QFont:
+        """Return a font that fits the text within the overlay width.
+
+        Starts from the estimated font size and shrinks until the text fits.
+        """
+        fm = QFontMetrics(self._font)
+        available_w = self.width() - self._padding * 2
+        text_w = max(fm.horizontalAdvance(self.translated_text),
+                     fm.horizontalAdvance("A") * 20)
+
+        if text_w <= available_w:
+            return self._font
+
+        # Text too wide — shrink font until it fits (but not below minimum)
+        font = QFont(self._font)
+        for px in range(self._font.pixelSize() - 1, self._min_font_size - 1, -1):
+            font.setPixelSize(px)
+            fm = QFontMetrics(font)
+            text_w = fm.horizontalAdvance(self.translated_text)
+            if text_w <= available_w:
+                return font
+        return font
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Rounded rect background
+        # Background
         painter.setBrush(QBrush(self._bg_color))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(self.rect(), self._border_radius, self._border_radius)
 
-        # Translated text
-        painter.setPen(QPen(self._text_color))
-        font = QFont("Microsoft YaHei", self._font_size)
+        # Determine best-fit font
+        font = self._effective_font()
         painter.setFont(font)
+        painter.setPen(QPen(self._text_color))
 
         text_rect = self.rect().adjusted(
             self._padding, self._padding, -self._padding, -self._padding
         )
 
+        # Use QTextDocument for word-wrapping
         doc = QTextDocument()
         doc.setDefaultFont(font)
         doc.setPlainText(self.translated_text)
         doc.setTextWidth(text_rect.width())
-        painter.translate(text_rect.topLeft())
+
+        # Vertically center the text block
+        doc_size = doc.documentLayout().documentSize()
+        y_offset = max(0, (text_rect.height() - doc_size.height()) / 2)
+        painter.translate(text_rect.left(), text_rect.top() + y_offset)
         doc.drawContents(painter)
+
+        painter.end()
 
     def mousePressEvent(self, event):
         self.close()
