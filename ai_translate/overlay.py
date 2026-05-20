@@ -1,31 +1,41 @@
-"""Transparent, stay-on-top overlay displaying translated text."""
+"""Transparent, stay-on-top overlay displaying translated text at original positions."""
 
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRect
+from PySide6.QtCore import Qt, QRect, QRectF
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush,
     QTextDocument, QFontMetrics,
 )
-from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtWidgets import QWidget
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
 class TranslationOverlay(QWidget):
+    """Overlay that renders each translated line at its original text position.
+
+    Parameters
+    ----------
+    rect: QRect
+        Logical geometry matching the selected region.
+    lines_data: list[tuple[str, int, int, int, int]]
+        Each tuple is (translated_text, x, y, w, h) in logical pixels.
+    is_dark_bg: bool
+        If True the original background is dark → use light text.
+    """
+
     def __init__(
         self,
         rect: QRect,
-        original: str,
-        translated: str,
-        font_size_px: int = 0,
-        dpr: float = 1.0,
+        lines_data: list,
+        is_dark_bg: bool = True,
     ):
         super().__init__()
-        self.original_text = original
-        self.translated_text = translated
         self._region = rect
+        self._lines_data = lines_data  # [(text, x, y, w, h), ...] in logical px
+        self._is_dark_bg = is_dark_bg
 
         with open(CONFIG_PATH, encoding="utf-8") as f:
             config = json.load(f)
@@ -33,19 +43,15 @@ class TranslationOverlay(QWidget):
 
         self._bg_color = QColor(ov["background_color"])
         self._bg_color.setAlphaF(ov["background_opacity"])
-        self._text_color = QColor(ov["text_color"])
         self._padding = ov["padding"]
         self._border_radius = ov["border_radius"]
-
-        # Determine font size: prefer estimated size, fall back to config
-        if font_size_px > 0 and dpr > 0:
-            logical_px = max(8, int(font_size_px / dpr))
-        else:
-            logical_px = ov["font_size"]
-        self._font = QFont("Microsoft YaHei")
-        self._font.setPixelSize(logical_px)
-
         self._min_font_size = ov["min_font_size"]
+
+        # Auto-contrast text colour
+        if is_dark_bg:
+            self._text_color = QColor("#e0e0e0")
+        else:
+            self._text_color = QColor("#1a1a1a")
 
         self._init_ui()
 
@@ -58,7 +64,6 @@ class TranslationOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-        # Size to match the original selected region exactly
         x = max(0, self._region.x())
         y = max(0, self._region.y())
         w = max(60, self._region.width())
@@ -66,26 +71,20 @@ class TranslationOverlay(QWidget):
         self.setGeometry(x, y, w, h)
         self.show()
 
-    def _effective_font(self) -> QFont:
-        """Return a font that fits the text within the overlay width.
+    def _font_for_line(self, line_h: int, text: str, available_w: int) -> QFont:
+        """Create a font that fits *text* inside *available_w* at the given line height."""
+        px = max(self._min_font_size, min(line_h, 48))
+        font = QFont("Microsoft YaHei")
+        font.setPixelSize(px)
 
-        Starts from the estimated font size and shrinks until the text fits.
-        """
-        fm = QFontMetrics(self._font)
-        available_w = self.width() - self._padding * 2
-        text_w = max(fm.horizontalAdvance(self.translated_text),
-                     fm.horizontalAdvance("A") * 20)
+        fm = QFontMetrics(font)
+        if fm.horizontalAdvance(text) <= available_w:
+            return font
 
-        if text_w <= available_w:
-            return self._font
-
-        # Text too wide — shrink font until it fits (but not below minimum)
-        font = QFont(self._font)
-        for px in range(self._font.pixelSize() - 1, self._min_font_size - 1, -1):
+        for px in range(px - 1, self._min_font_size - 1, -1):
             font.setPixelSize(px)
             fm = QFontMetrics(font)
-            text_w = fm.horizontalAdvance(self.translated_text)
-            if text_w <= available_w:
+            if fm.horizontalAdvance(text) <= available_w:
                 return font
         return font
 
@@ -93,31 +92,33 @@ class TranslationOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Background
+        # Full-region background
         painter.setBrush(QBrush(self._bg_color))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(self.rect(), self._border_radius, self._border_radius)
 
-        # Determine best-fit font
-        font = self._effective_font()
-        painter.setFont(font)
+        if not self._lines_data:
+            painter.end()
+            return
+
         painter.setPen(QPen(self._text_color))
 
-        text_rect = self.rect().adjusted(
-            self._padding, self._padding, -self._padding, -self._padding
-        )
+        for text, lx, ly, _lw, lh in self._lines_data:
+            available_w = max(20, self.width() - lx - self._padding)
+            font = self._font_for_line(lh, text, available_w)
+            painter.setFont(font)
 
-        # Use QTextDocument for word-wrapping
-        doc = QTextDocument()
-        doc.setDefaultFont(font)
-        doc.setPlainText(self.translated_text)
-        doc.setTextWidth(text_rect.width())
+            doc = QTextDocument()
+            doc.setDefaultFont(font)
+            doc.setPlainText(text)
+            doc.setTextWidth(available_w)
 
-        # Vertically center the text block
-        doc_size = doc.documentLayout().documentSize()
-        y_offset = max(0, (text_rect.height() - doc_size.height()) / 2)
-        painter.translate(text_rect.left(), text_rect.top() + y_offset)
-        doc.drawContents(painter)
+            painter.save()
+            painter.translate(lx, ly)
+            clip = QRectF(0, 0, available_w,
+                          max(20, self.height() - ly - self._padding))
+            doc.drawContents(painter, clip)
+            painter.restore()
 
         painter.end()
 

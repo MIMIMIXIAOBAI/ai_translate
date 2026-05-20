@@ -46,17 +46,31 @@ class OcrEngine:
         return self._do_ocr(img).strip()
 
     def recognize_with_size(self, image: Image.Image) -> tuple[str, int]:
-        """Return (text, estimated_font_height_in_physical_pixels).
+        """Return (text, estimated_font_height_in_physical_pixels)."""
+        text, font_px, _first_x, _first_y = self.recognize_with_layout(image)
+        return text, font_px
 
-        The font height is estimated from Tesseract word bounding boxes and
-        adjusted for the preprocessing scale factor so it matches the original
-        image scale.
+    def recognize_with_layout(self, image: Image.Image) -> tuple[str, int, int, int]:
+        """Return (text, font_px, first_word_x, first_word_y).
+
+        Coordinates are in the original image's pixel space, adjusted for
+        any preprocessing scale factor.
         """
         img, scale = self._preprocess(image)
         text = self._do_ocr(img).strip()
-        raw_height = self._estimate_font_height(img)
-        font_px = int(raw_height / scale) if scale > 1.0 else raw_height
-        return text, font_px
+        font_px, first_x, first_y = self._extract_layout(img, scale)
+        return text, font_px, first_x, first_y
+
+    def recognize_with_lines(self, image: Image.Image) -> tuple[str, int, list]:
+        """Return (full_text, font_px, line_boxes).
+
+        line_boxes is a list of (line_text, x, y, w, h) in original image pixels,
+        sorted by vertical then horizontal position.
+        """
+        img, scale = self._preprocess(image)
+        text = self._do_ocr(img).strip()
+        font_px, line_boxes = self._extract_lines(img, scale)
+        return text, font_px, line_boxes
 
     def _do_ocr(self, img: Image.Image) -> str:
         try:
@@ -85,21 +99,126 @@ class OcrEngine:
 
         return img, scale
 
-    def _estimate_font_height(self, img: Image.Image) -> int:
-        """Estimate median character height (px) from Tesseract word boxes."""
+    def _extract_layout(self, img: Image.Image, scale: float) -> tuple[int, int, int]:
+        """Return (font_height_px, first_word_x, first_word_y) in original image coords."""
         try:
             data = pytesseract.image_to_data(
-                img, lang="eng", config="--psm 6",
+                img, lang="eng+chi_sim", config="--psm 6",
                 output_type=pytesseract.Output.DICT,
             )
+        except pytesseract.TesseractError:
+            try:
+                data = pytesseract.image_to_data(
+                    img, lang="eng", config="--psm 6",
+                    output_type=pytesseract.Output.DICT,
+                )
+            except Exception:
+                return 0, 0, 0
+        except Exception:
+            return 0, 0, 0
+
+        try:
             heights = []
+            first_x = first_y = 0
+            found_first = False
             for i, level in enumerate(data["level"]):
                 if level == 5:  # word level
                     h_val = data["height"][i]
                     if h_val > 0:
                         heights.append(h_val)
-            if heights:
-                return int(statistics.median(heights))
+                        if not found_first:
+                            first_x = data["left"][i]
+                            first_y = data["top"][i]
+                            found_first = True
+
+            font_px = int(statistics.median(heights)) if heights else 0
+
+            if scale > 1.0:
+                font_px = int(font_px / scale)
+                first_x = int(first_x / scale)
+                first_y = int(first_y / scale)
+
+            return font_px, first_x, first_y
         except Exception:
-            pass
-        return 0
+            return 0, 0, 0
+
+    def _extract_lines(self, img: Image.Image, scale: float) -> tuple[int, list]:
+        """Return (font_px, line_boxes) where line_boxes = [(text, x, y, w, h), ...].
+
+        Groups word-level Tesseract data into lines and computes per-line
+        bounding boxes in original image coordinates.
+        """
+        try:
+            data = pytesseract.image_to_data(
+                img, lang="eng+chi_sim", config="--psm 6",
+                output_type=pytesseract.Output.DICT,
+            )
+        except pytesseract.TesseractError:
+            try:
+                data = pytesseract.image_to_data(
+                    img, lang="eng", config="--psm 6",
+                    output_type=pytesseract.Output.DICT,
+                )
+            except Exception:
+                return 0, []
+        except Exception:
+            return 0, []
+
+        try:
+            heights = []
+            # Collect all valid words with their spatial metadata
+            words = []
+            for i, level in enumerate(data["level"]):
+                if level == 5:
+                    h_val = data["height"][i]
+                    w_val = data["width"][i]
+                    word_text = (data["text"][i] or "").strip()
+                    if h_val > 0 and w_val > 0 and word_text:
+                        heights.append(h_val)
+                        words.append({
+                            "text": word_text,
+                            "left": data["left"][i],
+                            "top": data["top"][i],
+                            "width": w_val,
+                            "height": h_val,
+                            "line_num": data["line_num"][i],
+                            "block_num": data["block_num"][i],
+                            "par_num": data["par_num"][i],
+                        })
+
+            if not words:
+                return 0, []
+
+            font_px = int(statistics.median(heights)) if heights else 0
+
+            # Group words by (block_num, par_num, line_num)
+            groups: dict[tuple, list] = {}
+            for w in words:
+                key = (w["block_num"], w["par_num"], w["line_num"])
+                groups.setdefault(key, []).append(w)
+
+            # Compute per-line bounding box
+            line_boxes = []
+            for _key, group in groups.items():
+                line_text = " ".join(w["text"] for w in group)
+                min_x = min(w["left"] for w in group)
+                min_y = min(w["top"] for w in group)
+                max_x = max(w["left"] + w["width"] for w in group)
+                max_y = max(w["top"] + w["height"] for w in group)
+                line_boxes.append((line_text, min_x, min_y,
+                                   max_x - min_x, max_y - min_y))
+
+            # Sort by vertical then horizontal position
+            line_boxes.sort(key=lambda b: (b[2], b[1]))
+
+            if scale > 1.0:
+                font_px = int(font_px / scale)
+                line_boxes = [
+                    (t, int(x / scale), int(y / scale),
+                     int(w / scale), int(h / scale))
+                    for t, x, y, w, h in line_boxes
+                ]
+
+            return font_px, line_boxes
+        except Exception:
+            return 0, []

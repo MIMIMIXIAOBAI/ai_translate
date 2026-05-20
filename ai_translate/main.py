@@ -80,9 +80,29 @@ class _InfoToast(QWidget):
         self.close()
 
 
+def _sample_brightness(img: Image.Image) -> float:
+    """Return average perceived brightness (0–255) of an RGB PIL Image."""
+    small = img.resize((8, 8), Image.LANCZOS)
+    total = 0.0
+    count = 0
+    for pixel in small.getdata():
+        if isinstance(pixel, int):
+            total += pixel
+        else:
+            r, g, b = pixel[0], pixel[1], pixel[2]
+            total += 0.299 * r + 0.587 * g + 0.114 * b
+        count += 1
+    return total / max(count, 1)
+
+
 class _TranslateThread(QThread):
-    """Runs OCR + translation in a background thread."""
-    finished = Signal(str, str, QRect, int, float)
+    """Runs OCR + translation in a background thread.
+
+    Emits finished(QRect, list, bool) where list is [(text, x, y, w, h), ...]
+    in logical coordinates, and bool is whether the background is dark.
+    """
+
+    finished = Signal(QRect, object, bool)
     error = Signal(str)
 
     def __init__(self, img: Image.Image, rect: QRect, dpr: float):
@@ -94,16 +114,49 @@ class _TranslateThread(QThread):
     def run(self):
         try:
             ocr = OcrEngine()
-            text, font_px = ocr.recognize_with_size(self._img)
-            if not text:
-                self.error.emit("未识别到文字")
-                return
+            full_text, font_px, line_boxes = ocr.recognize_with_lines(self._img)
+
             translator = Translator()
-            translated = translator.translate(text)
-            if not translated:
-                self.error.emit("翻译结果为空")
-                return
-            self.finished.emit(text, translated, self._rect, font_px, self._dpr)
+            is_dark_bg = _sample_brightness(self._img) < 128
+            dpr = self._dpr
+
+            if line_boxes:
+                # Translate each line independently for positional accuracy
+                translated_lines = []
+                for line_text, x, y, w, h in line_boxes:
+                    try:
+                        t = translator.translate(line_text)
+                    except Exception:
+                        t = ""
+                    if not t or t == line_text:
+                        t = line_text
+                    # Convert position from physical to logical coordinates
+                    translated_lines.append((
+                        t,
+                        max(0, int(x / dpr)),
+                        max(0, int(y / dpr)),
+                        max(8, int(w / dpr)),
+                        max(8, int(h / dpr)),
+                    ))
+                self.finished.emit(self._rect, translated_lines, is_dark_bg)
+            else:
+                # Fallback: no line boxes found, translate entire block
+                text = full_text or ocr.recognize(self._img).strip()
+                if not text:
+                    self.error.emit("未识别到文字")
+                    return
+                try:
+                    translated = translator.translate(text)
+                except Exception:
+                    translated = ""
+                if not translated:
+                    self.error.emit("翻译结果为空")
+                    return
+                translated_lines = [(translated, 8, 8,
+                                     max(40, self._img.width // 2),
+                                     max(20, self._img.height // 2))]
+                self.finished.emit(self._rect, translated_lines, is_dark_bg)
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -187,11 +240,9 @@ class App:
 
         img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
 
-        # Show progress toast
         self._toast = _InfoToast("正在翻译...")
         self._toast.show()
 
-        # Start background thread
         dpr = selector.dpr
         self._thread = _TranslateThread(img, logical, dpr)
         self._thread.finished.connect(self._on_translation_done)
@@ -200,13 +251,12 @@ class App:
         self._thread.error.connect(lambda: setattr(self, '_thread', None))
         self._thread.start()
 
-    def _on_translation_done(self, original: str, translated: str, logical_rect: QRect,
-                            font_size_px: int = 0, dpr: float = 1.0):
+    def _on_translation_done(self, logical_rect: QRect, lines_data: list,
+                             is_dark_bg: bool):
         if self._toast:
             self._toast.close()
             self._toast = None
-        self._overlay = TranslationOverlay(
-            logical_rect, original, translated, font_size_px, dpr)
+        self._overlay = TranslationOverlay(logical_rect, lines_data, is_dark_bg)
 
     def _on_translation_error(self, msg: str):
         if self._toast:
