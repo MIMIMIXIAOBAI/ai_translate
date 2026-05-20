@@ -1,0 +1,6 @@
+pyside6>=6.5.0
+mss>=9.0.0
+pytesseract>=0.3.10
+deep-translator>=1.11.0
+pillow>=10.0.0
+keyboard>=0.13.5

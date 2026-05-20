@@ -1,0 +1,17 @@
+{
+    "target_language": "zh-CN",
+    "hotkey": "ctrl+shift+t",
+    "translation_service": "auto",
+    "proxy": null,
+    "overlay": {
+        "background_color": "#1e1e2e",
+        "background_opacity": 0.88,
+        "text_color": "#cdd6f4",
+        "font_size": 14,
+        "min_font_size": 10,
+        "max_width_ratio": 0.95,
+        "max_height_ratio": 0.95,
+        "padding": 12,
+        "border_radius": 8
+    }
+}
