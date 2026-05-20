@@ -1,5 +1,8 @@
 """Full-screen region selector with QRubberBand for click-and-drag selection."""
 
+import io
+from PIL import Image
+import mss
 from PySide6.QtCore import Qt, QRect, QPoint, Signal
 from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen
 from PySide6.QtWidgets import QWidget, QRubberBand, QApplication
@@ -8,8 +11,9 @@ from PySide6.QtWidgets import QWidget, QRubberBand, QApplication
 class RegionSelector(QWidget):
     """Modal, full-screen widget for drag-to-select screen region.
 
-    Uses Qt's native screen capture so the background matches pixel-perfectly
-    regardless of DPI scaling.
+    Captures the entire desktop background and dims it so the user can draw
+    a selection rectangle.  The widget uses logical (device-independent) Qt
+    coordinates; mss captures are done in physical pixels via DPR conversion.
     """
 
     selection_done = Signal(QRect)
@@ -28,6 +32,10 @@ class RegionSelector(QWidget):
     @property
     def accepted(self) -> bool:
         return self._accepted
+
+    @property
+    def dpr(self) -> float:
+        return self._dpr
 
     def _init_ui(self):
         self.setWindowFlags(
@@ -48,12 +56,29 @@ class RegionSelector(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def _capture_background(self):
-        """Capture the full desktop via Qt (DPI-aware, matches widget coords exactly)."""
-        screen = QApplication.primaryScreen()
-        if screen:
-            self._bg_pixmap = screen.grabWindow(0)
-        else:
-            self._bg_pixmap = QPixmap()
+        """Capture the full desktop via mss at physical resolution and scale to
+        widget logical size so the display is pixel-perfect at any DPI."""
+        geo = self.geometry()  # logical coords
+        dpr = self._dpr
+        with mss.MSS() as sct:
+            monitor = {
+                "left": int(geo.x() * dpr),
+                "top": int(geo.y() * dpr),
+                "width": int(geo.width() * dpr),
+                "height": int(geo.height() * dpr),
+            }
+            grabbed = sct.grab(monitor)
+        img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        raw = QPixmap()
+        raw.loadFromData(buf.getvalue())
+        # Scale physical-resolution pixmap to widget logical size → 1:1 display
+        self._bg_pixmap = raw.scaled(
+            geo.size(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     def physical_rect(self) -> QRect:
         """Convert the selected logical-coord rect to physical (mss) coordinates."""
@@ -74,7 +99,7 @@ class RegionSelector(QWidget):
             painter.drawPixmap(self.rect(), self._bg_pixmap)
 
         # Dim overlay
-        painter.fillRect(self.rect(), QBrush(QColor(0, 0, 0, 120)))
+        painter.fillRect(self.rect(), QBrush(QColor(0, 0, 0, 100)))
 
         # Punch a clear hole for the selection rectangle
         if self._rubber_band.isVisible():

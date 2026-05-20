@@ -27,7 +27,6 @@ CONFIG_PATH = BASE_DIR / "config.json"
 
 
 def _make_tray_icon() -> QIcon:
-    """Draw a simple '译' tray icon."""
     pix = QPixmap(64, 64)
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
@@ -81,20 +80,20 @@ class _InfoToast(QWidget):
         self.close()
 
 
-class _TranslateWorker(QObject):
-    """Runs OCR + translation in a background thread so the UI stays responsive."""
-    finished = Signal(str, str, QRect)   # original, translated, physical_rect
+class _TranslateThread(QThread):
+    """Runs OCR + translation in a background thread."""
+    finished = Signal(str, str, QRect)
     error = Signal(str)
 
-    def __init__(self, image: Image.Image, rect: QRect):
+    def __init__(self, img: Image.Image, rect: QRect):
         super().__init__()
-        self._image = image
+        self._img = img
         self._rect = rect
 
     def run(self):
         try:
             ocr = OcrEngine()
-            text = ocr.recognize(self._image)
+            text = ocr.recognize(self._img)
             if not text:
                 self.error.emit("未识别到文字")
                 return
@@ -118,9 +117,7 @@ class App:
 
         self._overlay: TranslationOverlay | None = None
         self._selector: RegionSelector | None = None
-        self._toast: _InfoToast | None = None
-        self._worker: _TranslateWorker | None = None
-        self._worker_thread: QThread | None = None
+        self._thread: _TranslateThread | None = None
 
         self._setup_tray()
         self._setup_hotkey()
@@ -157,7 +154,7 @@ class App:
 
         self._dismiss_overlay()
         self._selector = RegionSelector()
-        QTimer.singleShot(0, self._run_selector_loop)
+        QTimer.singleShot(50, self._run_selector_loop)
 
     def _run_selector_loop(self):
         from PySide6.QtCore import QEventLoop
@@ -166,6 +163,8 @@ class App:
         selector.selection_done.connect(loop.quit)
         selector.destroyed.connect(loop.quit)
         selector.show()
+        selector.raise_()
+        selector.activateWindow()
         loop.exec()
 
         if selector.accepted and selector.selected_rect is not None:
@@ -173,7 +172,7 @@ class App:
         self._selector = None
 
     def _process_region(self, selector: RegionSelector):
-        """Capture the selected region in physical pixels and start OCR + translate."""
+        """Capture the selected region and start OCR + translate in background."""
         physical = selector.physical_rect()
         logical = selector.selected_rect
 
@@ -187,39 +186,29 @@ class App:
 
         img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
 
-        # Show "translating" toast
+        # Show progress toast
         self._toast = _InfoToast("正在翻译...")
         self._toast.show()
 
-        # Run OCR + translation in background thread
-        self._worker = _TranslateWorker(img, logical)
-        self._worker_thread = QThread()
-        self._worker.moveToThread(self._worker_thread)
-        self._worker.finished.connect(self._on_translation_done)
-        self._worker.error.connect(self._on_translation_error)
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker_thread.start()
+        # Start background thread
+        self._thread = _TranslateThread(img, logical)
+        self._thread.finished.connect(self._on_translation_done)
+        self._thread.error.connect(self._on_translation_error)
+        self._thread.finished.connect(lambda: setattr(self, '_thread', None))
+        self._thread.error.connect(lambda: setattr(self, '_thread', None))
+        self._thread.start()
 
     def _on_translation_done(self, original: str, translated: str, logical_rect: QRect):
-        self._cleanup_worker()
         if self._toast:
             self._toast.close()
             self._toast = None
         self._overlay = TranslationOverlay(logical_rect, original, translated)
 
     def _on_translation_error(self, msg: str):
-        self._cleanup_worker()
         if self._toast:
             self._toast.close()
             self._toast = None
         self._show_info(f"翻译失败: {msg}")
-
-    def _cleanup_worker(self):
-        if self._worker_thread and self._worker_thread.isRunning():
-            self._worker_thread.quit()
-            self._worker_thread.wait()
-        self._worker = None
-        self._worker_thread = None
 
     # ── overlay management ──────────────────────────────────────────
 
@@ -228,7 +217,7 @@ class App:
             if self._overlay is not None:
                 self._overlay.close()
         except RuntimeError:
-            pass  # C++ object already destroyed
+            pass
         self._overlay = None
 
     def _show_info(self, message: str):
@@ -238,7 +227,9 @@ class App:
 
     def _shutdown(self):
         self._dismiss_overlay()
-        self._cleanup_worker()
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
         try:
             keyboard.unhook_all()
         except Exception:
