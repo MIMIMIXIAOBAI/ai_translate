@@ -1,23 +1,15 @@
 """Full-screen region selector with QRubberBand for click-and-drag selection."""
 
-import io
-import json
-from pathlib import Path
-
-from PIL import Image
-import mss
 from PySide6.QtCore import Qt, QRect, QPoint, Signal
 from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush, QPen
 from PySide6.QtWidgets import QWidget, QRubberBand, QApplication
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-
 
 class RegionSelector(QWidget):
-    """Modal, full-screen widget that lets the user drag to select a screen region.
+    """Modal, full-screen widget for drag-to-select screen region.
 
-    Shows a dimmed screenshot of the entire desktop as background. The selection
-    rectangle appears in its original brightness.
+    Uses Qt's native screen capture so the background matches pixel-perfectly
+    regardless of DPI scaling.
     """
 
     selection_done = Signal(QRect)
@@ -28,6 +20,7 @@ class RegionSelector(QWidget):
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self.selected_rect: QRect | None = None
         self._accepted = False
+        self._dpr: float = 1.0
 
         self._init_ui()
         self._capture_background()
@@ -44,46 +37,50 @@ class RegionSelector(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        # Cover entire virtual desktop (all monitors)
+
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.virtualGeometry()
+            self._dpr = screen.devicePixelRatio()
         else:
             geo = QRect(0, 0, 1920, 1080)
         self.setGeometry(geo)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def _capture_background(self):
-        """Capture all screens with mss and store as dimmable pixmap."""
-        geo = self.geometry()
-        with mss.mss() as sct:
-            monitor = {"left": geo.x(), "top": geo.y(),
-                       "width": geo.width(), "height": geo.height()}
-            grabbed = sct.grab(monitor)
-        img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        self._bg_pixmap = QPixmap()
-        self._bg_pixmap.loadFromData(buf.getvalue())
+        """Capture the full desktop via Qt (DPI-aware, matches widget coords exactly)."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            self._bg_pixmap = screen.grabWindow(0)
+        else:
+            self._bg_pixmap = QPixmap()
+
+    def physical_rect(self) -> QRect:
+        """Convert the selected logical-coord rect to physical (mss) coordinates."""
+        if self.selected_rect is None:
+            return QRect()
+        r = self.selected_rect
+        return QRect(
+            int(r.x() * self._dpr),
+            int(r.y() * self._dpr),
+            int(r.width() * self._dpr),
+            int(r.height() * self._dpr),
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
 
-        # Full-screen dimmed screenshot
         if self._bg_pixmap:
             painter.drawPixmap(self.rect(), self._bg_pixmap)
 
         # Dim overlay
-        dim = QColor(0, 0, 0, 120)
-        painter.fillRect(self.rect(), QBrush(dim))
+        painter.fillRect(self.rect(), QBrush(QColor(0, 0, 0, 120)))
 
         # Punch a clear hole for the selection rectangle
         if self._rubber_band.isVisible():
             r = self._rubber_band.geometry()
             if self._bg_pixmap:
-                # Draw original bright image inside the selection rect
                 painter.drawPixmap(r, self._bg_pixmap, r)
-            # Thin border around selection
             pen = QPen(QColor("#89b4fa"), 2)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -101,7 +98,7 @@ class RegionSelector(QWidget):
         if self._rubber_band.isVisible():
             rect = QRect(self._origin, event.position().toPoint()).normalized()
             self._rubber_band.setGeometry(rect)
-            self.update()  # repaint to show the clear hole
+            self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

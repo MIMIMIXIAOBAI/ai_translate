@@ -11,7 +11,7 @@ import mss
 from PIL import Image
 import keyboard
 
-from PySide6.QtCore import Qt, Signal, QObject, QRect, QTimer
+from PySide6.QtCore import Qt, Signal, QObject, QRect, QTimer, QThread
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QPen, QBrush
 from PySide6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QWidget,
@@ -48,7 +48,7 @@ class HotkeyBridge(QObject):
 
 
 class _InfoToast(QWidget):
-    """A brief, auto-dismissing toast message in the center of the screen."""
+    """A brief, auto-dismissing toast message."""
 
     def __init__(self, message: str):
         super().__init__()
@@ -81,6 +81,33 @@ class _InfoToast(QWidget):
         self.close()
 
 
+class _TranslateWorker(QObject):
+    """Runs OCR + translation in a background thread so the UI stays responsive."""
+    finished = Signal(str, str, QRect)   # original, translated, physical_rect
+    error = Signal(str)
+
+    def __init__(self, image: Image.Image, rect: QRect):
+        super().__init__()
+        self._image = image
+        self._rect = rect
+
+    def run(self):
+        try:
+            ocr = OcrEngine()
+            text = ocr.recognize(self._image)
+            if not text:
+                self.error.emit("未识别到文字")
+                return
+            translator = Translator()
+            translated = translator.translate(text)
+            if not translated:
+                self.error.emit("翻译结果为空")
+                return
+            self.finished.emit(text, translated, self._rect)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class App:
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -89,10 +116,11 @@ class App:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             self.config = json.load(f)
 
-        self.ocr = OcrEngine()
-        self.translator = Translator()
         self._overlay: TranslationOverlay | None = None
         self._selector: RegionSelector | None = None
+        self._toast: _InfoToast | None = None
+        self._worker: _TranslateWorker | None = None
+        self._worker_thread: QThread | None = None
 
         self._setup_tray()
         self._setup_hotkey()
@@ -103,10 +131,10 @@ class App:
         self.tray.setToolTip("AI Translate — Ctrl+Shift+T")
 
         menu = QMenu()
-        select_action = menu.addAction("Select Region\tCtrl+Shift+T")
+        select_action = menu.addAction("框选翻译\tCtrl+Shift+T")
         select_action.triggered.connect(self.start_selection)
         menu.addSeparator()
-        quit_action = menu.addAction("Quit")
+        quit_action = menu.addAction("退出")
         quit_action.triggered.connect(self._shutdown)
         self.tray.setContextMenu(menu)
         self.tray.show()
@@ -121,14 +149,14 @@ class App:
             print(f"Warning: Could not register hotkey '{hotkey}'. "
                   "Use the tray icon to activate.")
 
+    # ── selection pipeline ───────────────────────────────────────────
+
     def start_selection(self):
-        """Begin the select → OCR → translate → overlay pipeline."""
         if self._selector is not None:
-            return  # already selecting
+            return
 
         self._dismiss_overlay()
         self._selector = RegionSelector()
-        # Use a local event loop to block until selection completes
         QTimer.singleShot(0, self._run_selector_loop)
 
     def _run_selector_loop(self):
@@ -141,45 +169,66 @@ class App:
         loop.exec()
 
         if selector.accepted and selector.selected_rect is not None:
-            rect = selector.selected_rect
-            self._process_region(rect)
+            self._process_region(selector)
         self._selector = None
 
-    def _process_region(self, rect: QRect):
-        """Capture, OCR, translate, and display overlay for the selected region."""
-        try:
-            # Capture the selected screen region
-            with mss.mss() as sct:
-                monitor = {
-                    "left": rect.x(), "top": rect.y(),
-                    "width": rect.width(), "height": rect.height(),
-                }
-                grabbed = sct.grab(monitor)
+    def _process_region(self, selector: RegionSelector):
+        """Capture the selected region in physical pixels and start OCR + translate."""
+        physical = selector.physical_rect()
+        logical = selector.selected_rect
 
-            img = Image.frombytes(
-                "RGB", (grabbed.width, grabbed.height), grabbed.rgb)
+        with mss.MSS() as sct:
+            monitor = {
+                "left": physical.x(), "top": physical.y(),
+                "width": max(1, physical.width()),
+                "height": max(1, physical.height()),
+            }
+            grabbed = sct.grab(monitor)
 
-            # OCR
-            text = self.ocr.recognize(img)
-            if not text:
-                self._show_info("No text detected in the selected region.")
-                return
+        img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
 
-            # Translate
-            translated = self.translator.translate(text)
-            if not translated:
-                self._show_info("Translation returned empty.")
-                return
+        # Show "translating" toast
+        self._toast = _InfoToast("正在翻译...")
+        self._toast.show()
 
-            # Show overlay
-            self._overlay = TranslationOverlay(rect, text, translated)
+        # Run OCR + translation in background thread
+        self._worker = _TranslateWorker(img, logical)
+        self._worker_thread = QThread()
+        self._worker.moveToThread(self._worker_thread)
+        self._worker.finished.connect(self._on_translation_done)
+        self._worker.error.connect(self._on_translation_error)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker_thread.start()
 
-        except Exception as e:
-            self._show_info(f"Error: {e}")
+    def _on_translation_done(self, original: str, translated: str, logical_rect: QRect):
+        self._cleanup_worker()
+        if self._toast:
+            self._toast.close()
+            self._toast = None
+        self._overlay = TranslationOverlay(logical_rect, original, translated)
+
+    def _on_translation_error(self, msg: str):
+        self._cleanup_worker()
+        if self._toast:
+            self._toast.close()
+            self._toast = None
+        self._show_info(f"翻译失败: {msg}")
+
+    def _cleanup_worker(self):
+        if self._worker_thread and self._worker_thread.isRunning():
+            self._worker_thread.quit()
+            self._worker_thread.wait()
+        self._worker = None
+        self._worker_thread = None
+
+    # ── overlay management ──────────────────────────────────────────
 
     def _dismiss_overlay(self):
-        if self._overlay and self._overlay.isVisible():
-            self._overlay.close()
+        try:
+            if self._overlay is not None:
+                self._overlay.close()
+        except RuntimeError:
+            pass  # C++ object already destroyed
         self._overlay = None
 
     def _show_info(self, message: str):
@@ -189,6 +238,7 @@ class App:
 
     def _shutdown(self):
         self._dismiss_overlay()
+        self._cleanup_worker()
         try:
             keyboard.unhook_all()
         except Exception:
