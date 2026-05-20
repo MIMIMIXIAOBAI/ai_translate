@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Particle Sphere</title>
+    <style>
+        :root {
+            --bg: #050510;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--bg);
+            overflow: hidden;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+            height: 100vh;
+            width: 100vw;
+            cursor: default;
+        }
+
+        canvas#three-canvas {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        #webcam-preview {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            width: 180px;
+            height: 135px;
+            border-radius: 12px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            object-fit: cover;
+            z-index: 10;
+            transform: scaleX(-1);
+            opacity: 0.8;
+            transition: opacity 0.3s;
+            background: rgba(0, 0, 0, 0.5);
+        }
+        #webcam-preview:hover {
+            opacity: 1;
+        }
+
+        #status-bar {
+            position: fixed;
+            top: 28px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        #gesture-label {
+            color: #fff;
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-align: center;
+            padding: 10px 28px;
+            border-radius: 40px;
+            background: rgba(255, 255, 255, 0.06);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
+        }
+        #gesture-label.fist {
+            border-color: rgba(255, 100, 100, 0.5);
+            box-shadow: 0 0 30px rgba(255, 80, 80, 0.25);
+            color: #ff9999;
+        }
+        #gesture-label.open {
+            border-color: rgba(100, 200, 255, 0.5);
+            box-shadow: 0 0 30px rgba(80, 180, 255, 0.25);
+            color: #99ccff;
+        }
+
+        #hint {
+            position: fixed;
+            bottom: 28px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 13px;
+            letter-spacing: 0.03em;
+            text-align: center;
+        }
+
+        #no-cam-msg {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 20;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 15px;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 20px 32px;
+            border-radius: 16px;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            line-height: 1.6;
+        }
+        #no-cam-msg kbd {
+            display: inline-block;
+            padding: 2px 10px;
+            margin: 0 2px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            font-family: inherit;
+            font-size: 13px;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="three-canvas"></canvas>
+    <video id="webcam-preview" autoplay playsinline muted></video>
+
+    <div id="status-bar">
+        <span id="gesture-label">● 默认状态</span>
+    </div>
+    <div id="hint">
+        握拳 = 压缩 &nbsp;|&nbsp; 张开手掌 = 发散 &nbsp;|&nbsp; 键盘: <kbd>←</kbd><kbd>→</kbd> 切换
+    </div>
+    <div id="no-cam-msg">
+        摄像头未连接<br>
+        使用键盘 <kbd>←</kbd> <kbd>→</kbd> 控制粒子<br>
+        <span style="font-size:12px;opacity:0.6">握拳 / 张开手掌</span>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"
+        crossorigin="anonymous"></script>
+
+    <script>
+        (function () {
+            // ────────────────────────────────────
+            // DOM refs
+            // ────────────────────────────────────
+            const canvas = document.getElementById('three-canvas');
+            const videoEl = document.getElementById('webcam-preview');
+            const gestureLabel = document.getElementById('gesture-label');
+            const noCamMsg = document.getElementById('no-cam-msg');
+            const hintEl = document.getElementById('hint');
+
+            // ────────────────────────────────────
+            // State
+            // ────────────────────────────────────
+            const PARTICLE_COUNT = 2200;
+            const BASE_RADIUS = 3.5;
+            const state = {
+                targetRadius: BASE_RADIUS,
+                currentRadius: BASE_RADIUS,
+                velocity: 0,
+                hueOffset: 0,
+                gesture: 'default', // 'default' | 'fist' | 'open'
+                gestureSmoothed: 'default',
+                handPresent: false,
+                camReady: false,
+                // for smoothing gesture detection
+                gestureVotes: [], // rolling window of recent classifications
+                VOTE_WINDOW: 15,
+            };
+
+            // ────────────────────────────────────
+            // Three.js setup
+            // ────────────────────────────────────
+            const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+            const scene = new THREE.Scene();
+
+            const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.5, 50);
+            camera.position.z = 9;
+
+            // ────────────────────────────────────
+            // Glow texture (canvas radial gradient)
+            // ────────────────────────────────────
+            function createGlowTexture(size, innerColor, outerColor) {
+                const c = document.createElement('canvas');
+                c.width = size;
+                c.height = size;
+                const ctx = c.getContext('2d');
+                const half = size / 2;
+                const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+                grad.addColorStop(0, innerColor);
+                grad.addColorStop(0.08, innerColor);
+                grad.addColorStop(0.25, 'rgba(255,255,255,0.7)');
+                grad.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+                grad.addColorStop(0.75, 'rgba(255,255,255,0.03)');
+                grad.addColorStop(1, outerColor);
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, 0, size, size);
+                const tex = new THREE.CanvasTexture(c);
+                tex.needsUpdate = true;
+                return tex;
+            }
+            const glowTex = createGlowTexture(128, 'rgba(255,255,255,1)', 'rgba(0,0,0,0)');
+
+            // ────────────────────────────────────
+            // Background stars
+            // ────────────────────────────────────
+            {
+                const starCount = 600;
+                const starGeo = new THREE.BufferGeometry();
+                const starPos = new Float32Array(starCount * 3);
+                for (let i = 0; i < starCount; i++) {
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    const r = 15 + Math.random() * 10;
+                    starPos[i * 3] = Math.sin(phi) * Math.cos(theta) * r;
+                    starPos[i * 3 + 1] = Math.sin(phi) * Math.sin(theta) * r;
+                    starPos[i * 3 + 2] = Math.cos(phi) * r;
+                }
+                starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+                const starMat = new THREE.PointsMaterial({
+                    size: 0.04,
+                    color: 0xffffff,
+                    transparent: true,
+                    opacity: 0.5,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false,
+                });
+                const stars = new THREE.Points(starGeo, starMat);
+                stars.name = 'stars';
+                scene.add(stars);
+            }
+
+            // ────────────────────────────────────
+            // Main particle sphere
+            // ────────────────────────────────────
+            const sphereGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3);
+
+            // base unit-sphere positions (fibonacci sphere)
+            const basePositions = new Float32Array(PARTICLE_COUNT * 3);
+            const noisePhases = new Float32Array(PARTICLE_COUNT);
+            const noiseAmps = new Float32Array(PARTICLE_COUNT);
+            const phi = Math.PI * (3 - Math.sqrt(5));
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const y = 1 - (i / (PARTICLE_COUNT - 1)) * 2;
+                const radiusAtY = Math.sqrt(1 - y * y);
+                const theta = phi * i;
+
+                const bx = Math.cos(theta) * radiusAtY;
+                const by = y;
+                const bz = Math.sin(theta) * radiusAtY;
+
+                basePositions[i * 3] = bx;
+                basePositions[i * 3 + 1] = by;
+                basePositions[i * 3 + 2] = bz;
+
+                // initial display positions (with slight noise)
+                const jitter = 0.06;
+                positions[i * 3] = bx * BASE_RADIUS + (Math.random() - 0.5) * jitter;
+                positions[i * 3 + 1] = by * BASE_RADIUS + (Math.random() - 0.5) * jitter;
+                positions[i * 3 + 2] = bz * BASE_RADIUS + (Math.random() - 0.5) * jitter;
+
+                colors[i * 3] = 1;
+                colors[i * 3 + 1] = 1;
+                colors[i * 3 + 2] = 1;
+
+                noisePhases[i] = Math.random() * Math.PI * 2;
+                noiseAmps[i] = 0.02 + Math.random() * 0.08;
+            }
+
+            sphereGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            sphereGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const sphereMat = new THREE.PointsMaterial({
+                size: 0.18,
+                map: glowTex,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9,
+            });
+
+            const sphere = new THREE.Points(sphereGeo, sphereMat);
+            sphere.name = 'main-sphere';
+            scene.add(sphere);
+
+            // ────────────────────────────────────
+            // Orbiting ring particles (decorative)
+            // ────────────────────────────────────
+            const ringParticles = [];
+            {
+                const ringCount = 400;
+                const ringGeo = new THREE.BufferGeometry();
+                const ringPos = new Float32Array(ringCount * 3);
+                const ringCol = new Float32Array(ringCount * 3);
+                // pre-compute deterministic offsets to avoid per-frame random flicker
+                const ringOffsets = new Float32Array(ringCount * 2);
+                for (let i = 0; i < ringCount; i++) {
+                    ringOffsets[i * 2] = (Math.random() - 0.5) * 1.2;
+                    ringOffsets[i * 2 + 1] = (Math.random() - 0.5) * 0.6;
+                }
+                for (let i = 0; i < ringCount; i++) {
+                    const angle = (i / ringCount) * Math.PI * 2;
+                    const r = BASE_RADIUS * 1.4 + ringOffsets[i * 2];
+                    const height = ringOffsets[i * 2 + 1];
+                    ringPos[i * 3] = Math.cos(angle) * r;
+                    ringPos[i * 3 + 1] = height;
+                    ringPos[i * 3 + 2] = Math.sin(angle) * r;
+                    ringCol[i * 3] = 0.7;
+                    ringCol[i * 3 + 1] = 0.7;
+                    ringCol[i * 3 + 2] = 1;
+                }
+                ringGeo.setAttribute('position', new THREE.BufferAttribute(ringPos, 3));
+                ringGeo.setAttribute('color', new THREE.BufferAttribute(ringCol, 3));
+                const ringMat = new THREE.PointsMaterial({
+                    size: 0.06,
+                    map: glowTex,
+                    vertexColors: true,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false,
+                    transparent: true,
+                    opacity: 0.55,
+                });
+                const ring = new THREE.Points(ringGeo, ringMat);
+                ring.name = 'ring';
+                scene.add(ring);
+                ringParticles.push({ mesh: ring, count: ringCount, baseRadius: BASE_RADIUS * 1.4, offsets: ringOffsets });
+            }
+
+            // ────────────────────────────────────
+            // Lighting / fog – none (additive blending looks best without)
+            // ────────────────────────────────────
+
+            // ────────────────────────────────────
+            // Spring physics config
+            // ────────────────────────────────────
+            const SPRING = {
+                stiffness: 0.04,
+                damping: 0.82,
+            };
+
+            // ────────────────────────────────────
+            // Gesture detection helpers
+            // ────────────────────────────────────
+
+            /** Finger landmarks indices (MediaPipe) */
+            const FINGERS = {
+                thumb: { tip: 4, pip: 3, mcp: 2, cmc: 1 },
+                index: { tip: 8, pip: 6, mcp: 5 },
+                middle: { tip: 12, pip: 10, mcp: 9 },
+                ring: { tip: 16, pip: 14, mcp: 13 },
+                pinky: { tip: 20, pip: 18, mcp: 17 },
+            };
+
+            function isFingerExtended(landmarks, finger) {
+                const tip = landmarks[finger.tip];
+                const pip = landmarks[finger.pip];
+                const mcp = landmarks[finger.mcp];
+
+                const tipDist = Math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z);
+                const pipDist = Math.hypot(pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z);
+
+                // extended if tip is significantly farther from mcp than pip is
+                return tipDist > pipDist * 1.25;
+            }
+
+            function isThumbExtended(landmarks) {
+                const tip = landmarks[4];
+                const ip = landmarks[3];
+                const mcp = landmarks[2];
+                const tipDist = Math.hypot(tip.x - mcp.x, tip.y - mcp.y, tip.z - mcp.z);
+                const ipDist = Math.hypot(ip.x - mcp.x, ip.y - mcp.y, ip.z - mcp.z);
+                return tipDist > ipDist * 1.35;
+            }
+
+            function classifyGesture(landmarks) {
+                if (!landmarks || landmarks.length < 21) return 'default';
+
+                const indexExt = isFingerExtended(landmarks, FINGERS.index);
+                const middleExt = isFingerExtended(landmarks, FINGERS.middle);
+                const ringExt = isFingerExtended(landmarks, FINGERS.ring);
+                const pinkyExt = isFingerExtended(landmarks, FINGERS.pinky);
+                const thumbExt = isThumbExtended(landmarks);
+
+                const extendedCount = [indexExt, middleExt, ringExt, pinkyExt, thumbExt]
+                    .filter(Boolean).length;
+
+                if (extendedCount <= 1) return 'fist';
+                if (extendedCount >= 4) return 'open';
+                return 'default';
+            }
+
+            function smoothGesture(gesture) {
+                state.gestureVotes.push(gesture);
+                if (state.gestureVotes.length > state.VOTE_WINDOW) {
+                    state.gestureVotes.shift();
+                }
+                // count occurrences
+                const counts = { fist: 0, open: 0, default: 0 };
+                for (const g of state.gestureVotes) counts[g]++;
+                // require >= 60% consensus to switch
+                const total = state.gestureVotes.length;
+                if (counts.fist >= total * 0.6) return 'fist';
+                if (counts.open >= total * 0.6) return 'open';
+                return 'default';
+            }
+
+            // ────────────────────────────────────
+            // Keyboard fallback
+            // ────────────────────────────────────
+            let keyGesture = null; // null | 'fist' | 'open'
+            window.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
+                    keyGesture = 'fist';
+                }
+                if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
+                    keyGesture = 'open';
+                }
+            });
+            window.addEventListener('keyup', () => {
+                keyGesture = null;
+            });
+
+            // ────────────────────────────────────
+            // MediaPipe Hands
+            // ────────────────────────────────────
+            function initMediaPipe() {
+                const hands = new Hands({
+                    locateFile: (file) =>
+                        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+                });
+
+                hands.setOptions({
+                    maxNumHands: 1,
+                    modelComplexity: 1,
+                    minDetectionConfidence: 0.7,
+                    minTrackingConfidence: 0.5,
+                });
+
+                hands.onResults((results) => {
+                    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                        const landmarks = results.multiHandLandmarks[0];
+                        const rawGesture = classifyGesture(landmarks);
+                        state.gestureSmoothed = smoothGesture(rawGesture);
+                        state.handPresent = true;
+                    } else {
+                        // no hand visible → count as "default" votes toward return
+                        state.gestureVotes.push('default');
+                        if (state.gestureVotes.length > state.VOTE_WINDOW) {
+                            state.gestureVotes.shift();
+                        }
+                        state.handPresent = false;
+                    }
+                });
+
+                const cameraUtils = new Camera(videoEl, {
+                    onFrame: async () => {
+                        await hands.send({ image: videoEl });
+                    },
+                    width: 640,
+                    height: 480,
+                });
+
+                cameraUtils.start().then(() => {
+                    state.camReady = true;
+                    noCamMsg.style.display = 'none';
+                    videoEl.style.display = 'block';
+                }).catch((err) => {
+                    console.warn('Camera not available:', err);
+                    state.camReady = false;
+                    noCamMsg.style.display = 'block';
+                    videoEl.style.display = 'none';
+                    hintEl.innerHTML =
+                        '使用键盘 <kbd>←</kbd> <kbd>→</kbd> 或 <kbd>A</kbd> <kbd>D</kbd> 控制粒子 &nbsp;|&nbsp; 握拳=压缩 张开=发散';
+                });
+            }
+
+            // ────────────────────────────────────
+            // Animation
+            // ────────────────────────────────────
+            const clock = new THREE.Clock();
+
+            function getEffectiveGesture() {
+                if (keyGesture) return keyGesture;
+                if (state.camReady && state.handPresent) return state.gestureSmoothed;
+                if (!state.camReady) return 'default';
+                return 'default';
+            }
+
+            function getTargetRadius(gesture) {
+                switch (gesture) {
+                    case 'fist':
+                        return BASE_RADIUS * 0.32;
+                    case 'open':
+                        return BASE_RADIUS * 2.6;
+                    default:
+                        return BASE_RADIUS;
+                }
+            }
+
+            function animate() {
+                requestAnimationFrame(animate);
+
+                const dt = Math.min(clock.getDelta(), 0.1);
+                const time = performance.now() * 0.001;
+
+                // Determine effective gesture
+                const effectiveGesture = getEffectiveGesture();
+                const targetR = getTargetRadius(effectiveGesture);
+
+                // ── Spring physics ─────────────────
+                const force = (targetR - state.currentRadius) * SPRING.stiffness;
+                state.velocity += force;
+                state.velocity *= SPRING.damping;
+                state.currentRadius += state.velocity;
+
+                // When very close to target, snap
+                if (Math.abs(state.currentRadius - targetR) < 0.005 && Math.abs(state.velocity) < 0.005) {
+                    state.currentRadius = targetR;
+                    state.velocity = 0;
+                }
+
+                // ── Update gesture label ──────────
+                if (effectiveGesture !== state.gesture) {
+                    state.gesture = effectiveGesture;
+                    gestureLabel.className = '';
+                    switch (effectiveGesture) {
+                        case 'fist':
+                            gestureLabel.textContent = '✊ 握拳 — 压缩中';
+                            gestureLabel.className = 'fist';
+                            break;
+                        case 'open':
+                            gestureLabel.textContent = '✋ 张开手掌 — 发散中';
+                            gestureLabel.className = 'open';
+                            break;
+                        default:
+                            gestureLabel.textContent = '● 默认状态';
+                            gestureLabel.className = '';
+                    }
+                }
+
+                // ── Update color hue ──────────────
+                state.hueOffset = (state.hueOffset + dt * 0.025) % 1; // ~40s full cycle
+
+                // ── Update particle positions & colors ──
+                const posArr = sphereGeo.attributes.position.array;
+                const colArr = sphereGeo.attributes.color.array;
+                const radius = state.currentRadius;
+                const radiusRatio = radius / BASE_RADIUS;
+
+                // spiral twist during transitions
+                const spiralAngle = state.velocity * 2.5;
+                const cosSpiral = Math.cos(spiralAngle);
+                const sinSpiral = Math.sin(spiralAngle);
+
+                // Color saturation & lightness modulate with radius
+                const sat = 0.85;
+                const light = 0.45 + Math.min(radiusRatio, 2.0) * 0.2;
+
+                const color = new THREE.Color();
+
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    const bx = basePositions[i * 3];
+                    const by = basePositions[i * 3 + 1];
+                    const bz = basePositions[i * 3 + 2];
+
+                    // noise displacement (stronger when compressing/expanding)
+                    const noiseFactor = Math.abs(radius - BASE_RADIUS) / BASE_RADIUS;
+                    const noiseScale = 0.03 + noiseFactor * 0.18;
+                    const nx = Math.sin(time * 3.7 + noisePhases[i]) * noiseAmps[i] * noiseScale;
+                    const ny = Math.cos(time * 4.1 + noisePhases[i]) * noiseAmps[i] * noiseScale;
+                    const nz = Math.sin(time * 3.3 + noisePhases[i] + 1.5) * noiseAmps[i] * noiseScale;
+
+                    // apply spiral twist to base position
+                    const rbx = bx * cosSpiral - bz * sinSpiral;
+                    const rbz = bx * sinSpiral + bz * cosSpiral;
+
+                    posArr[i * 3] = rbx * radius + nx;
+                    posArr[i * 3 + 1] = by * radius + ny;
+                    posArr[i * 3 + 2] = rbz * radius + nz;
+
+                    // color: HSL based on particle position + time
+                    const particleBaseHue = (by * 0.5 + 0.5) * 0.7; // 0..0.7 based on Y
+                    const hue = (state.hueOffset + particleBaseHue) % 1;
+                    color.setHSL(hue, sat, light);
+                    colArr[i * 3] = color.r;
+                    colArr[i * 3 + 1] = color.g;
+                    colArr[i * 3 + 2] = color.b;
+                }
+                sphereGeo.attributes.position.needsUpdate = true;
+                sphereGeo.attributes.color.needsUpdate = true;
+
+                // Adjust point size based on radius (smaller = brighter/denser look)
+                sphereMat.size = 0.18 / Math.sqrt(radiusRatio);
+
+                // ── Update ring ────────────────────
+                if (ringParticles.length > 0) {
+                    const ring = ringParticles[0];
+                    const ringPosArr = ring.mesh.geometry.attributes.position.array;
+                    const ringColArr = ring.mesh.geometry.attributes.color.array;
+                    const ringR = ring.baseRadius * radiusRatio;
+                    const offs = ring.offsets;
+                    for (let i = 0; i < ring.count; i++) {
+                        const angle = (i / ring.count) * Math.PI * 2;
+                        const r = ringR + offs[i * 2] * radiusRatio;
+                        ringPosArr[i * 3] = Math.cos(angle + time * 0.3) * r;
+                        ringPosArr[i * 3 + 1] = offs[i * 2 + 1] * radiusRatio;
+                        ringPosArr[i * 3 + 2] = Math.sin(angle + time * 0.3) * r;
+
+                        const ringHue = (state.hueOffset + 0.5 + i / ring.count * 0.3) % 1;
+                        color.setHSL(ringHue, 0.7, 0.5);
+                        ringColArr[i * 3] = color.r;
+                        ringColArr[i * 3 + 1] = color.g;
+                        ringColArr[i * 3 + 2] = color.b;
+                    }
+                    ring.mesh.geometry.attributes.position.needsUpdate = true;
+                    ring.mesh.geometry.attributes.color.needsUpdate = true;
+                    ring.mesh.material.size = 0.06 / Math.sqrt(Math.max(radiusRatio, 0.35));
+                    ring.mesh.material.opacity = 0.3 + Math.min(radiusRatio, 1.5) * 0.15;
+                }
+
+                // ── Rotate sphere ──────────────────
+                sphere.rotation.y += dt * 0.25;
+                sphere.rotation.x += Math.sin(time * 0.4) * dt * 0.08;
+                if (ringParticles.length > 0) {
+                    ringParticles[0].mesh.rotation.y += dt * 0.35;
+                    ringParticles[0].mesh.rotation.x = sphere.rotation.x;
+                }
+
+                // ── Rotate background stars ────────
+                const stars = scene.getObjectByName('stars');
+                if (stars) {
+                    stars.rotation.y += dt * 0.03;
+                    stars.rotation.x += dt * 0.015;
+                }
+
+                // ── Render ─────────────────────────
+                renderer.render(scene, camera);
+            }
+
+            // ────────────────────────────────────
+            // Resize handler
+            // ────────────────────────────────────
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            // ────────────────────────────────────
+            // Touch support for mobile
+            // ────────────────────────────────────
+            window.addEventListener('touchstart', (e) => {
+                if (e.touches.length >= 3) {
+                    keyGesture = 'fist'; // multi-touch = fist
+                }
+            }, { passive: true });
+            window.addEventListener('touchend', () => {
+                keyGesture = null;
+            });
+
+            // ────────────────────────────────────
+            // Start
+            // ────────────────────────────────────
+            initMediaPipe();
+            animate();
+        })();
+    </script>
+</body>
+</html>
