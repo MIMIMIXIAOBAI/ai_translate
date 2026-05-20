@@ -157,9 +157,7 @@ class App:
                 grabbed = sct.grab(monitor)
 
             img = Image.frombytes(
-                "RGBA", (grabbed.width, grabbed.height),
-                grabbed.pixels, "raw", "BGRA",
-            ).convert("RGB")
+                "RGB", (grabbed.width, grabbed.height), grabbed.rgb)
 
             # OCR
             text = self.ocr.recognize(img)

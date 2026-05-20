@@ -60,8 +60,7 @@ class RegionSelector(QWidget):
             monitor = {"left": geo.x(), "top": geo.y(),
                        "width": geo.width(), "height": geo.height()}
             grabbed = sct.grab(monitor)
-        img = Image.frombytes("RGBA", (grabbed.width, grabbed.height),
-                              grabbed.pixels, "raw", "BGRA").convert("RGB")
+        img = Image.frombytes("RGB", (grabbed.width, grabbed.height), grabbed.rgb)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         self._bg_pixmap = QPixmap()
