@@ -1,9 +1,11 @@
 """OCR engine using Tesseract with Pillow image preprocessing."""
 
+import os
 import statistics
 import sys
 import shutil
 from pathlib import Path
+from urllib.request import urlopen
 
 from PIL import Image, ImageFilter, ImageEnhance
 import pytesseract
@@ -20,7 +22,6 @@ def _find_tesseract() -> str | None:
             r"C:\Program Files\Tesseract-OCR\tesseract.exe",
             r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         ]
-        import os
         local = os.environ.get("LOCALAPPDATA", "")
         if local:
             candidates.append(Path(local) / "Programs" / "Tesseract-OCR" / "tesseract.exe")
@@ -34,10 +35,109 @@ def _auto_configure_tesseract():
     path = _find_tesseract()
     if path:
         pytesseract.pytesseract.tesseract_cmd = path
+        # Also set TESSDATA_PREFIX to system tessdata so get_languages works
+        sys_td = Path(path).parent / "tessdata"
+        if sys_td.is_dir():
+            os.environ.setdefault("TESSDATA_PREFIX", str(sys_td))
 
 
 _auto_configure_tesseract()
 
+# ── language pack management ──────────────────────────────────────────
+
+_ocr_langs = "eng"
+_user_tessdata: Path | None = None
+_tessdata_config = ""  # extra config fragment for --tessdata-dir
+
+
+def _download_lang(lang_code: str, dest_dir: Path) -> bool:
+    """Download a .traineddata file from multiple mirrors."""
+    mirrors = [
+        f"https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/{lang_code}.traineddata",
+        f"https://ghproxy.net/https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/{lang_code}.traineddata",
+    ]
+    data = None
+    for url in mirrors:
+        try:
+            with urlopen(url, timeout=60) as resp:
+                data = resp.read()
+            break
+        except Exception:
+            continue
+
+    if data is None:
+        print(f"  Could not reach any mirror for {lang_code}.traineddata")
+        print(f"  Please download manually from:")
+        print(f"    {mirrors[0]}")
+        print(f"  and save to: {dest_dir}")
+        return False
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / f"{lang_code}.traineddata"
+    target.write_bytes(data)
+    return True
+
+
+def _init_languages():
+    """Populate a user-local tessdata with all needed language packs.
+
+    The Windows Tesseract tessdata under Program Files is read-only
+    without admin, so we mirror everything into %APPDATA%/ai-translate/tessdata
+    and pass --tessdata-dir to every Tesseract invocation.
+    """
+    global _ocr_langs, _user_tessdata, _tessdata_config
+
+    appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
+    user_td = Path(appdata) / "ai-translate" / "tessdata"
+    user_td.mkdir(parents=True, exist_ok=True)
+    _user_tessdata = user_td
+    _tessdata_config = f"--tessdata-dir {user_td}"
+
+    # Copy system traineddata into user dir (avoid admin permissions later)
+    tess_cmd = pytesseract.pytesseract.tesseract_cmd
+    if tess_cmd:
+        sys_td = Path(tess_cmd).parent / "tessdata"
+        if sys_td.is_dir():
+            for src in sys_td.glob("*.traineddata"):
+                dst = user_td / src.name
+                if not dst.exists():
+                    try:
+                        dst.write_bytes(src.read_bytes())
+                    except Exception:
+                        pass
+
+    # Enumerate installed languages from the user directory
+    installed: set[str] = set()
+    for f in user_td.glob("*.traineddata"):
+        installed.add(f.stem)
+
+    # Download missing language packs
+    wanted = ["chi_sim", "jpn"]
+    missing = [l for l in wanted if l not in installed]
+    if missing:
+        print("=" * 56)
+        print("AI Translate — installing Tesseract language packs …")
+        for lang in missing:
+            print(f"  {lang}.traineddata —", end=" ")
+            if _download_lang(lang, user_td):
+                installed.add(lang)
+                print("installed.")
+            else:
+                print("FAILED.")
+        print("=" * 56)
+
+    # Update TESSDATA_PREFIX so get_languages still works for scripts
+    os.environ["TESSDATA_PREFIX"] = str(user_td)
+
+    preferred = ["eng", "chi_sim", "jpn"]
+    available = [l for l in preferred if l in installed]
+    _ocr_langs = "+".join(available) if available else "eng"
+
+
+_init_languages()
+
+
+# ── OCR engine ────────────────────────────────────────────────────────
 
 class OcrEngine:
     def recognize(self, image: Image.Image) -> str:
@@ -51,52 +151,45 @@ class OcrEngine:
         return text, font_px
 
     def recognize_with_layout(self, image: Image.Image) -> tuple[str, int, int, int]:
-        """Return (text, font_px, first_word_x, first_word_y).
-
-        Coordinates are in the original image's pixel space, adjusted for
-        any preprocessing scale factor.
-        """
+        """Return (text, font_px, first_word_x, first_word_y)."""
         img, scale = self._preprocess(image)
         text = self._do_ocr(img).strip()
         font_px, first_x, first_y = self._extract_layout(img, scale)
         return text, font_px, first_x, first_y
 
     def recognize_with_lines(self, image: Image.Image) -> tuple[str, int, list]:
-        """Return (full_text, font_px, line_boxes).
-
-        line_boxes is a list of (line_text, x, y, w, h) in original image pixels,
-        sorted by vertical then horizontal position.
-        """
+        """Return (full_text, font_px, line_boxes)."""
         img, scale = self._preprocess(image)
         text = self._do_ocr(img).strip()
         font_px, line_boxes = self._extract_lines(img, scale)
         return text, font_px, line_boxes
 
+    def _do_ocr(self, img: Image.Image) -> str:
+        cfg = _tessdata_config + " --psm 6"
+        try:
+            return pytesseract.image_to_string(img, lang=_ocr_langs, config=cfg)
+        except pytesseract.TesseractError:
+            return pytesseract.image_to_string(img, lang="eng", config=cfg)
+
     def _image_to_data(self, img: Image.Image) -> dict | None:
-        """Call pytesseract.image_to_data with language fallback chain."""
-        for langs in ("eng+chi_sim+jpn", "eng+chi_sim", "eng+jpn", "eng"):
+        """Call pytesseract.image_to_data with available languages."""
+        cfg = _tessdata_config + " --psm 6"
+        try:
+            return pytesseract.image_to_data(
+                img, lang=_ocr_langs, config=cfg,
+                output_type=pytesseract.Output.DICT,
+            )
+        except pytesseract.TesseractError:
             try:
                 return pytesseract.image_to_data(
-                    img, lang=langs, config="--psm 6",
+                    img, lang="eng", config=cfg,
                     output_type=pytesseract.Output.DICT,
                 )
             except pytesseract.TesseractError:
-                continue
-        return None
-
-    def _do_ocr(self, img: Image.Image) -> str:
-        for langs in ("eng+chi_sim+jpn", "eng+chi_sim", "eng+jpn", "eng"):
-            try:
-                return pytesseract.image_to_string(img, lang=langs, config="--psm 6")
-            except pytesseract.TesseractError:
-                continue
-        return ""
+                return None
 
     def _preprocess(self, image: Image.Image) -> tuple[Image.Image, float]:
-        """Enhance image for better OCR accuracy.
-
-        Returns (preprocessed_image, scale_factor).
-        """
+        """Enhance image for better OCR accuracy."""
         img = image.convert("L")  # grayscale
 
         scale = 1.0
@@ -123,7 +216,7 @@ class OcrEngine:
             first_x = first_y = 0
             found_first = False
             for i, level in enumerate(data["level"]):
-                if level == 5:  # word level
+                if level == 5:
                     h_val = data["height"][i]
                     if h_val > 0:
                         heights.append(h_val)
@@ -144,18 +237,13 @@ class OcrEngine:
             return 0, 0, 0
 
     def _extract_lines(self, img: Image.Image, scale: float) -> tuple[int, list]:
-        """Return (font_px, line_boxes) where line_boxes = [(text, x, y, w, h), ...].
-
-        Groups word-level Tesseract data into lines and computes per-line
-        bounding boxes in original image coordinates.
-        """
+        """Return (font_px, line_boxes) where line_boxes = [(text, x, y, w, h), ...]."""
         data = self._image_to_data(img)
         if data is None:
             return 0, []
 
         try:
             heights = []
-            # Collect all valid words with their spatial metadata
             words = []
             for i, level in enumerate(data["level"]):
                 if level == 5:
@@ -180,13 +268,11 @@ class OcrEngine:
 
             font_px = int(statistics.median(heights)) if heights else 0
 
-            # Group words by (block_num, par_num, line_num)
             groups: dict[tuple, list] = {}
             for w in words:
                 key = (w["block_num"], w["par_num"], w["line_num"])
                 groups.setdefault(key, []).append(w)
 
-            # Compute per-line bounding box
             line_boxes = []
             for _key, group in groups.items():
                 line_text = " ".join(w["text"] for w in group)
@@ -197,7 +283,6 @@ class OcrEngine:
                 line_boxes.append((line_text, min_x, min_y,
                                    max_x - min_x, max_y - min_y))
 
-            # Sort by vertical then horizontal position
             line_boxes.sort(key=lambda b: (b[2], b[1]))
 
             if scale > 1.0:
