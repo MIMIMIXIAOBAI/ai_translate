@@ -5,7 +5,6 @@ Hotkey Ctrl+Shift+T or system tray → select a screen region → OCR → transl
 
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import mss
@@ -121,34 +120,47 @@ class _TranslateThread(QThread):
             dpr = self._dpr
 
             if line_boxes:
-                # Translate lines in parallel for speed
-                def _translate_one(line_text: str) -> str:
-                    try:
-                        result = Translator().translate(line_text)
-                        return result if result and result != line_text else line_text
-                    except Exception:
-                        return line_text
+                # Translate full text in one request (avoids Baidu QPS limits)
+                combined_text = "\n".join(lb[0] for lb in line_boxes)
+                try:
+                    translated_full = Translator().translate(combined_text)
+                except Exception:
+                    translated_full = ""
+                if not translated_full:
+                    translated_full = combined_text
 
-                n = len(line_boxes)
-                texts = [lb[0] for lb in line_boxes]
-                results = [None] * n
-                with ThreadPoolExecutor(max_workers=min(n, 8)) as pool:
-                    fut_map = {pool.submit(_translate_one, txt): i
-                               for i, txt in enumerate(texts)}
-                    for fut in as_completed(fut_map):
-                        i = fut_map[fut]
-                        results[i] = fut.result()
+                # Try to split back to per-line translations
+                translated_parts = [p.strip() for p in translated_full.split("\n")]
+                parts = [p for p in translated_parts if p]
 
                 translated_lines = []
-                for i, (orig_text, x, y, w, h) in enumerate(line_boxes):
-                    line_result = results[i] if results[i] else orig_text
-                    translated_lines.append((
-                        line_result,
-                        max(0, int(x / dpr)),
-                        max(0, int(y / dpr)),
-                        max(8, int(w / dpr)),
-                        max(8, int(h / dpr)),
-                    ))
+                if len(parts) == len(line_boxes):
+                    # Perfect match — pair each translated part with its line position
+                    for i, (orig_text, x, y, w, h) in enumerate(line_boxes):
+                        translated_lines.append((
+                            parts[i],
+                            max(0, int(x / dpr)),
+                            max(0, int(y / dpr)),
+                            max(8, int(w / dpr)),
+                            max(8, int(h / dpr)),
+                        ))
+                else:
+                    # Split mismatch — spread translated text across line positions
+                    n = len(line_boxes)
+                    chars = list(translated_full.replace("\n", " "))
+                    chunk_len = max(1, len(chars) // n)
+                    for i, (_orig_text, x, y, w, h) in enumerate(line_boxes):
+                        start = i * chunk_len
+                        end = start + chunk_len if i < n - 1 else len(chars)
+                        chunk = "".join(chars[start:end]).strip()
+                        translated_lines.append((
+                            chunk,
+                            max(0, int(x / dpr)),
+                            max(0, int(y / dpr)),
+                            max(8, int(w / dpr)),
+                            max(8, int(h / dpr)),
+                        ))
+
                 self.finished.emit(self._rect, translated_lines, is_dark_bg)
             else:
                 # Fallback: no line boxes found, translate entire block
