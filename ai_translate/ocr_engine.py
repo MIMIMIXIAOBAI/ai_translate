@@ -72,12 +72,25 @@ class OcrEngine:
         font_px, line_boxes = self._extract_lines(img, scale)
         return text, font_px, line_boxes
 
+    def _image_to_data(self, img: Image.Image) -> dict | None:
+        """Call pytesseract.image_to_data with language fallback chain."""
+        for langs in ("eng+chi_sim+jpn", "eng+chi_sim", "eng+jpn", "eng"):
+            try:
+                return pytesseract.image_to_data(
+                    img, lang=langs, config="--psm 6",
+                    output_type=pytesseract.Output.DICT,
+                )
+            except pytesseract.TesseractError:
+                continue
+        return None
+
     def _do_ocr(self, img: Image.Image) -> str:
-        try:
-            text = pytesseract.image_to_string(img, lang="eng+chi_sim", config="--psm 6")
-        except pytesseract.TesseractError:
-            text = pytesseract.image_to_string(img, lang="eng", config="--psm 6")
-        return text
+        for langs in ("eng+chi_sim+jpn", "eng+chi_sim", "eng+jpn", "eng"):
+            try:
+                return pytesseract.image_to_string(img, lang=langs, config="--psm 6")
+            except pytesseract.TesseractError:
+                continue
+        return ""
 
     def _preprocess(self, image: Image.Image) -> tuple[Image.Image, float]:
         """Enhance image for better OCR accuracy.
@@ -101,20 +114,8 @@ class OcrEngine:
 
     def _extract_layout(self, img: Image.Image, scale: float) -> tuple[int, int, int]:
         """Return (font_height_px, first_word_x, first_word_y) in original image coords."""
-        try:
-            data = pytesseract.image_to_data(
-                img, lang="eng+chi_sim", config="--psm 6",
-                output_type=pytesseract.Output.DICT,
-            )
-        except pytesseract.TesseractError:
-            try:
-                data = pytesseract.image_to_data(
-                    img, lang="eng", config="--psm 6",
-                    output_type=pytesseract.Output.DICT,
-                )
-            except Exception:
-                return 0, 0, 0
-        except Exception:
+        data = self._image_to_data(img)
+        if data is None:
             return 0, 0, 0
 
         try:
@@ -148,20 +149,8 @@ class OcrEngine:
         Groups word-level Tesseract data into lines and computes per-line
         bounding boxes in original image coordinates.
         """
-        try:
-            data = pytesseract.image_to_data(
-                img, lang="eng+chi_sim", config="--psm 6",
-                output_type=pytesseract.Output.DICT,
-            )
-        except pytesseract.TesseractError:
-            try:
-                data = pytesseract.image_to_data(
-                    img, lang="eng", config="--psm 6",
-                    output_type=pytesseract.Output.DICT,
-                )
-            except Exception:
-                return 0, []
-        except Exception:
+        data = self._image_to_data(img)
+        if data is None:
             return 0, []
 
         try:

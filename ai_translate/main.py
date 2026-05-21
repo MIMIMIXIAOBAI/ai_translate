@@ -5,6 +5,7 @@ Hotkey Ctrl+Shift+T or system tray → select a screen region → OCR → transl
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import mss
@@ -114,25 +115,35 @@ class _TranslateThread(QThread):
     def run(self):
         try:
             ocr = OcrEngine()
-            full_text, font_px, line_boxes = ocr.recognize_with_lines(self._img)
+            full_text, _font_px, line_boxes = ocr.recognize_with_lines(self._img)
 
-            translator = Translator()
             is_dark_bg = _sample_brightness(self._img) < 128
             dpr = self._dpr
 
             if line_boxes:
-                # Translate each line independently for positional accuracy
-                translated_lines = []
-                for line_text, x, y, w, h in line_boxes:
+                # Translate lines in parallel for speed
+                def _translate_one(line_text: str) -> str:
                     try:
-                        t = translator.translate(line_text)
+                        result = Translator().translate(line_text)
+                        return result if result and result != line_text else line_text
                     except Exception:
-                        t = ""
-                    if not t or t == line_text:
-                        t = line_text
-                    # Convert position from physical to logical coordinates
+                        return line_text
+
+                n = len(line_boxes)
+                texts = [lb[0] for lb in line_boxes]
+                results = [None] * n
+                with ThreadPoolExecutor(max_workers=min(n, 8)) as pool:
+                    fut_map = {pool.submit(_translate_one, txt): i
+                               for i, txt in enumerate(texts)}
+                    for fut in as_completed(fut_map):
+                        i = fut_map[fut]
+                        results[i] = fut.result()
+
+                translated_lines = []
+                for i, (orig_text, x, y, w, h) in enumerate(line_boxes):
+                    line_result = results[i] if results[i] else orig_text
                     translated_lines.append((
-                        t,
+                        line_result,
                         max(0, int(x / dpr)),
                         max(0, int(y / dpr)),
                         max(8, int(w / dpr)),
@@ -146,7 +157,7 @@ class _TranslateThread(QThread):
                     self.error.emit("未识别到文字")
                     return
                 try:
-                    translated = translator.translate(text)
+                    translated = Translator().translate(text)
                 except Exception:
                     translated = ""
                 if not translated:
