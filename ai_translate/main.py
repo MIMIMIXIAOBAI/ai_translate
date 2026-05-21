@@ -232,9 +232,13 @@ class App:
         selector.activateWindow()
         loop.exec()
 
-        if selector.accepted and selector.selected_rect is not None:
-            self._process_region(selector)
-        self._selector = None
+        try:
+            if selector.accepted and selector.selected_rect is not None:
+                self._process_region(selector)
+        except Exception as e:
+            self._show_info(f"处理失败: {e}")
+        finally:
+            self._selector = None
 
     def _process_region(self, selector: RegionSelector):
         """Capture the selected region and start OCR + translate in background."""

@@ -2,6 +2,8 @@
     "target_language": "zh-CN",
     "hotkey": "ctrl+shift+t",
     "translation_service": "auto",
+    "baidu_appid": "",
+    "baidu_key": "iISp_d877c3a0upoorusu5qk0",
     "proxy": null,
     "overlay": {
         "background_color": "#1e1e2e",
