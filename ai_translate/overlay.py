@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRect, QRectF
+from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush,
     QTextDocument, QFontMetrics,
@@ -68,8 +68,12 @@ class TranslationOverlay(QWidget):
         self.show()
 
     def _font_for_line(self, line_h: int, text: str, available_w: int) -> QFont:
-        """Create a font that fits *text* inside *available_w* at the given line height."""
-        px = max(self._min_font_size, min(line_h, 48))
+        """Create a font that fits inside the available width at ~70 % of line height.
+
+        Using the full line height as pixel-size produces rendered glyphs that
+        are taller than the original bounding box, causing bottom clipping.
+        """
+        px = max(self._min_font_size, int(line_h * 0.7))
         font = QFont("Microsoft YaHei")
         font.setPixelSize(px)
 
@@ -111,9 +115,7 @@ class TranslationOverlay(QWidget):
 
             painter.save()
             painter.translate(lx, ly)
-            clip = QRectF(0, 0, available_w,
-                          max(20, self.height() - ly - self._padding))
-            doc.drawContents(painter, clip)
+            doc.drawContents(painter)
             painter.restore()
 
         painter.end()
