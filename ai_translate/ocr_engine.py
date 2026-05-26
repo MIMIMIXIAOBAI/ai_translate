@@ -43,6 +43,25 @@ def _auto_configure_tesseract():
 
 _auto_configure_tesseract()
 
+_TESSERACT_AVAILABLE = _find_tesseract() is not None
+
+
+class _TesseractNotFoundError(RuntimeError):
+    """Raised when Tesseract OCR is not installed."""
+
+    def __init__(self):
+        super().__init__(
+            "未找到 Tesseract OCR 引擎，无法进行文字识别。\n\n"
+            "请先安装 Tesseract OCR：\n"
+            "  • Windows: winget install tesseract\n"
+            "    或从 https://github.com/UB-Mannheim/tesseract/wiki 下载安装包\n"
+            "    安装时请务必勾选 Chinese (Simplified) 语言包\n"
+            "  • macOS: brew install tesseract tesseract-lang\n"
+            "  • Linux: sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim\n\n"
+            "安装完成后重新启动本程序即可。"
+        )
+
+
 # ── language pack management ──────────────────────────────────────────
 
 _ocr_langs = "eng"
@@ -84,6 +103,9 @@ def _init_languages():
     The Windows Tesseract tessdata under Program Files is read-only
     without admin, so we mirror everything into %APPDATA%/ai-translate/tessdata
     and pass --tessdata-dir to every Tesseract invocation.
+
+    When Tesseract is not installed, this still creates the user tessdata
+    directory so language packs can be pre-downloaded for later use.
     """
     global _ocr_langs, _user_tessdata, _tessdata_config
 
@@ -94,17 +116,18 @@ def _init_languages():
     _tessdata_config = f"--tessdata-dir {user_td}"
 
     # Copy system traineddata into user dir (avoid admin permissions later)
-    tess_cmd = pytesseract.pytesseract.tesseract_cmd
-    if tess_cmd:
-        sys_td = Path(tess_cmd).parent / "tessdata"
-        if sys_td.is_dir():
-            for src in sys_td.glob("*.traineddata"):
-                dst = user_td / src.name
-                if not dst.exists():
-                    try:
-                        dst.write_bytes(src.read_bytes())
-                    except Exception:
-                        pass
+    if _TESSERACT_AVAILABLE:
+        tess_cmd = pytesseract.pytesseract.tesseract_cmd
+        if tess_cmd:
+            sys_td = Path(tess_cmd).parent / "tessdata"
+            if sys_td.is_dir():
+                for src in sys_td.glob("*.traineddata"):
+                    dst = user_td / src.name
+                    if not dst.exists():
+                        try:
+                            dst.write_bytes(src.read_bytes())
+                        except Exception:
+                            pass
 
     # Enumerate installed languages from the user directory
     installed: set[str] = set()
@@ -165,6 +188,8 @@ class OcrEngine:
         return text, font_px, line_boxes
 
     def _do_ocr(self, img: Image.Image) -> str:
+        if not _TESSERACT_AVAILABLE:
+            raise _TesseractNotFoundError()
         cfg = _tessdata_config + " --psm 6"
         try:
             return pytesseract.image_to_string(img, lang=_ocr_langs, config=cfg)
@@ -173,6 +198,8 @@ class OcrEngine:
 
     def _image_to_data(self, img: Image.Image) -> dict | None:
         """Call pytesseract.image_to_data with available languages."""
+        if not _TESSERACT_AVAILABLE:
+            raise _TesseractNotFoundError()
         cfg = _tessdata_config + " --psm 6"
         try:
             return pytesseract.image_to_data(

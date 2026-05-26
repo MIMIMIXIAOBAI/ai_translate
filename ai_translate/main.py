@@ -145,16 +145,24 @@ class _TranslateThread(QThread):
                             max(8, int(h / dpr)),
                         ))
                 else:
-                    # Split mismatch — spread translated text across line positions
-                    n = len(line_boxes)
-                    chars = list(translated_full.replace("\n", " "))
-                    chunk_len = max(1, len(chars) // n)
-                    for i, (_orig_text, x, y, w, h) in enumerate(line_boxes):
-                        start = i * chunk_len
-                        end = start + chunk_len if i < n - 1 else len(chars)
-                        chunk = "".join(chars[start:end]).strip()
+                    # Line count mismatch — batch translation lost line structure.
+                    # Fall back to translating each line individually with a small
+                    # delay between calls to respect API rate limits (e.g. Baidu QPS).
+                    translator = Translator()
+                    for i, (orig_text, x, y, w, h) in enumerate(line_boxes):
+                        line_text = orig_text.strip()
+                        if not line_text:
+                            continue
+                        try:
+                            if i > 0:
+                                QThread.msleep(600)  # ~1 QPS ceiling
+                            translated = translator.translate(line_text)
+                        except Exception:
+                            translated = line_text  # show original as fallback
+                        if not translated:
+                            translated = line_text
                         translated_lines.append((
-                            chunk,
+                            translated,
                             max(0, int(x / dpr)),
                             max(0, int(y / dpr)),
                             max(8, int(w / dpr)),

@@ -47,7 +47,7 @@ class TranslationOverlay(QWidget):
         self._border_radius = ov["border_radius"]
         self._min_font_size = ov["min_font_size"]
 
-        self._text_color = QColor("#ffffff")
+        self._text_color = QColor(ov["text_color"])
 
         self._init_ui()
 
